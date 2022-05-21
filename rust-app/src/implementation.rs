@@ -1,26 +1,34 @@
 use crate::crypto_helpers::{detecdsa_sign, get_pkh, get_private_key, get_pubkey, Hasher};
 use crate::interface::*;
-use crate::*;
 use arrayvec::ArrayVec;
 use core::fmt::Write;
-use ledger_log::{info};
 use ledger_parser_combinators::interp_parser::{
-    Action, DefaultInterp, DropInterp, InterpParser, ObserveBytes, SubInterp,
+    Action, DefaultInterp, DropInterp, ObserveBytes, SubInterp
 };
+use pin_project::pin_project;
+use core::future::Future;
+use ledger_parser_combinators::async_parser::*;
+
 use crate::ui::write_scroller;
 
 use core::convert::TryFrom;
+use core::task::*;
+use ledger_async_block::*;
 
 // A couple type ascription functions to help the compiler along.
 const fn mkfn<A,B,C>(q: fn(&A,&mut B)->C) -> fn(&A,&mut B)->C {
-  q
+    q
+}
+const fn mkfinfun(a: fn(ArrayVec<u32, 10>) -> Option<ArrayVec<u8, 128>>) -> fn(ArrayVec<u32, 10>) -> Option<ArrayVec<u8, 128>> {
+    a
 }
 
-pub type GetAddressImplT = impl InterpParser<Bip32Key, Returning = ArrayVec<u8, 260_usize>>;
+
+pub type GetAddressImplT = impl AsyncParser<Bip32Key, ByteStream> + HasOutput<Bip32Key, Output=ArrayVec<u8, 128>>; // Returning = ArrayVec<u8, 260_usize>>;
 
 pub static GET_ADDRESS_IMPL: GetAddressImplT =
-    Action(SubInterp(DefaultInterp), mkfn(|path: &ArrayVec<u32, 10>, destination: &mut Option<ArrayVec<u8, 260>>| {
-        let key = get_pubkey(path).ok()?;
+    Action(SubInterp(DefaultInterp), mkfinfun(|path: ArrayVec<u32, 10>| -> Option<ArrayVec<u8, 128>> {
+        let key = get_pubkey(&path).ok()?;
 
         let pkh = get_pkh(key);
 
@@ -28,102 +36,155 @@ pub static GET_ADDRESS_IMPL: GetAddressImplT =
         // ask permission from the user.
         write_scroller("Provide Public Key", |w| Ok(write!(w, "{}", pkh)?))?;
 
-        *destination=Some(ArrayVec::new());
-        let p = destination.as_mut()?;
+        let mut p = ArrayVec::new();
         p.try_push(u8::try_from(key.W_len).ok()?).ok()?;
         p.try_extend_from_slice(&key.W[1..key.W_len as usize]).ok()?;
+        Some(p)
+    }));
+
+#[derive(Copy, Clone)]
+pub struct GetAddress; // (pub GetAddressImplT);
+
+impl AsyncAPDU for GetAddress {
+    // const MAX_PARAMS : usize = 1;
+    type State<'c> = impl Future<Output = ()>;
+
+    fn run<'c>(self, io: HostIO, input: ArrayVec<ByteStream, MAX_PARAMS >) -> Self::State<'c> {
+        let mut param = input[0].clone();
+        async move {
+            let address = GET_ADDRESS_IMPL.parse(&mut param).await;
+            io.result_final(&address).await;
+        }
+    }
+}
+
+impl<'d> AsyncAPDUStated<ParsersStateCtr> for GetAddress {
+    #[inline(never)]
+    fn init<'a, 'b: 'a>(
+        self,
+        s: &mut core::pin::Pin<&'a mut ParsersState<'a>>,
+        io: HostIO,
+        input: ArrayVec<ByteStream, MAX_PARAMS>
+    ) -> () {
+        s.set(ParsersState::GetAddressState(self.run(io, input)));
+    }
+
+    /*
+    #[inline(never)]
+    fn get<'a, 'b>(self, s: &'b mut core::pin::Pin<&'a mut ParsersState<'a>>) -> Option<&'b mut core::pin::Pin<&'a mut Self::State<'a>>> {
+        match s.as_mut().project() {
+            ParsersStateProjection::GetAddressState(ref mut s) => Some(s),
+            _ => panic!("Oops"),
+        }
+    }*/
+
+    #[inline(never)]
+    fn poll<'a, 'b>(self, s: &mut core::pin::Pin<&'a mut ParsersState>) -> core::task::Poll<()> {
+        let waker = unsafe { Waker::from_raw(RawWaker::new(&(), &RAW_WAKER_VTABLE)) };
+        let mut ctxd = Context::from_waker(&waker);
+        match s.as_mut().project() {
+            ParsersStateProjection::GetAddressState(ref mut s) => s.as_mut().poll(&mut ctxd),
+            _ => panic!("Ooops"),
+        }
+    }
+}
+
+
+#[derive(Copy, Clone)]
+pub struct Sign;
+
+// Transaction parser; this should prompt the user a lot more than this.
+
+const TXN_PARSER : impl AsyncParser<Transaction, ByteStream> + HasOutput<Transaction, Output = [u8; 32]> = Action(ObserveBytes(Hasher::new, Hasher::update, DropInterp),
+mkfn(|(hash, _): &(Hasher, Option<() /*ArrayVec<(), { usize::MAX }>*/>), destination: &mut _| {
+    let the_hash = hash.clone().finalize();
+
+    write_scroller("Sign Hash?", |w| Ok(write!(w, "{}", the_hash)?))?;
+
+    *destination = Some(the_hash.0.into());
+    Some(())
+}));
+
+
+const PRIVKEY_PARSER : impl AsyncParser<Bip32Key, ByteStream> + HasOutput<Bip32Key, Output=nanos_sdk::bindings::cx_ecfp_private_key_t>= Action(
+    SubInterp(DefaultInterp),
+    // And ask the user if this is the key the meant to sign with:
+    mkfn(|path: &ArrayVec<u32, 10>, destination: &mut _| {
+        let privkey = get_private_key(path).ok()?;
+        let pubkey = get_pubkey(path).ok()?; // Redoing work here; fix.
+        let pkh = get_pkh(pubkey);
+
+        write_scroller("With PKH", |w| Ok(write!(w, "{}", pkh)?))?;
+
+        *destination = Some(privkey);
         Some(())
     }));
 
-pub type SignImplT = impl InterpParser<SignParameters, Returning = ArrayVec<u8, 260_usize>>;
+impl AsyncAPDU for Sign {
+    // const MAX_PARAMS : usize = 2;
 
-pub static SIGN_IMPL: SignImplT = Action(
-    (
-        Action(
-            // Calculate the hash of the transaction
-            ObserveBytes(Hasher::new, Hasher::update, SubInterp(DropInterp)),
-            // Ask the user if they accept the transaction body's hash
-            mkfn(|(hash, _): &(Hasher, Option<ArrayVec<(), { usize::MAX }>>), destination: &mut _| {
-                let the_hash = hash.clone().finalize();
+    type State<'c> = impl Future<Output = ()>;
 
-                write_scroller("Sign Hash?", |w| Ok(write!(w, "{}", the_hash)?))?;
+    fn run<'c>(self, io: HostIO, mut input: ArrayVec<ByteStream, MAX_PARAMS>) -> Self::State<'c> {
+        async move {
+            let hash = TXN_PARSER.parse(&mut input[0]).await;
 
-                *destination = Some(the_hash.0.into());
-                Some(())
-            }),
-        ),
-        Action(
-            SubInterp(DefaultInterp),
-            // And ask the user if this is the key the meant to sign with:
-            mkfn(|path: &ArrayVec<u32, 10>, destination: &mut _| {
-                let privkey = get_private_key(path).ok()?;
-                let pubkey = get_pubkey(path).ok()?; // Redoing work here; fix.
-                let pkh = get_pkh(pubkey);
+            let privkey = PRIVKEY_PARSER.parse(&mut input[1]).await;
 
-                write_scroller("With PKH", |w| Ok(write!(w, "{}", pkh)?))?;
+            let (sig, len) = detecdsa_sign(&hash[..], &privkey).unwrap();
 
-                *destination = Some(privkey);
-                Some(())
-            }),
-        ),
-    ),
-    mkfn(|(hash, key): &(Option<[u8; 32]>, Option<_>), destination: &mut _| {
-        // By the time we get here, we've approved and just need to do the signature.
-        let (sig, len) = detecdsa_sign(hash.as_ref()?, key.as_ref()?)?;
-        let mut rv = ArrayVec::<u8, 260>::new();
-        rv.try_extend_from_slice(&sig[0..len as usize]).ok()?;
-        *destination = Some(rv);
-        Some(())
-    }),
-);
+            io.result_final(&sig[0..len as usize]).await;
+        }
+    }
+}
+
+impl<'d> AsyncAPDUStated<ParsersStateCtr> for Sign {
+    #[inline(never)]
+    fn init<'a, 'b: 'a>(
+        self,
+        s: &mut core::pin::Pin<&'a mut ParsersState<'a>>,
+        io: HostIO,
+        input: ArrayVec<ByteStream, MAX_PARAMS>
+    ) -> () {
+        s.set(ParsersState::SignState(self.run(io, input)));
+    }
+
+    #[inline(never)]
+    fn poll<'a>(self, s: &mut core::pin::Pin<&'a mut ParsersState>) -> core::task::Poll<()> {
+        let waker = unsafe { Waker::from_raw(RawWaker::new(&(), &RAW_WAKER_VTABLE)) };
+        let mut ctxd = Context::from_waker(&waker);
+        match s.as_mut().project() {
+            ParsersStateProjection::SignState(ref mut s) => s.as_mut().poll(&mut ctxd),
+            _ => panic!("Ooops"),
+        }
+    }
+}
 
 // The global parser state enum; any parser above that'll be used as the implementation for an APDU
 // must have a field here.
 
-pub enum ParsersState {
+// type GetAddressStateType = impl Future;
+// type SignStateType = impl Future<Output = ()>;
+
+#[pin_project(project = ParsersStateProjection)]
+pub enum ParsersState<'a> {
     NoState,
-    GetAddressState(<GetAddressImplT as InterpParser<Bip32Key>>::State),
-    SignState(<SignImplT as InterpParser<SignParameters>>::State),
+    GetAddressState(#[pin] <GetAddress as AsyncAPDU>::State<'a>), // <GetAddressImplT<'a> as AsyncParser<Bip32Key, ByteStream<'a>>>::State<'a>),
+    SignState(#[pin] <Sign as AsyncAPDU>::State<'a>),
+    // SignState(#[pin] <SignImplT<'a> as AsyncParser<SignParameters, ByteStream<'a>>>::State<'a>),
 }
 
-#[inline(never)]
-pub fn get_get_address_state(
-    s: &mut ParsersState,
-) -> &mut <GetAddressImplT as InterpParser<Bip32Key>>::State {
-    match s {
-        ParsersState::GetAddressState(_) => {}
-        _ => {
-            info!("Non-same state found; initializing state.");
-            *s = ParsersState::GetAddressState(<GetAddressImplT as InterpParser<Bip32Key>>::init(
-                &GET_ADDRESS_IMPL,
-            ));
-        }
-    }
-    match s {
-        ParsersState::GetAddressState(ref mut a) => a,
-        _ => {
-            panic!("")
-        }
+impl<'a> Default for ParsersState<'a> {
+    fn default() -> Self {
+        ParsersState::NoState
     }
 }
 
-#[inline(never)]
-pub fn get_sign_state(
-    s: &mut ParsersState,
-) -> &mut <SignImplT as InterpParser<SignParameters>>::State {
-    match s {
-        ParsersState::SignState(_) => {}
-        _ => {
-            info!("Non-same state found; initializing state.");
-            *s = ParsersState::SignState(<SignImplT as InterpParser<SignParameters>>::init(
-                &SIGN_IMPL,
-            ));
-        }
-    }
-    match s {
-        ParsersState::SignState(ref mut a) => a,
-        _ => {
-            panic!("")
-        }
-    }
+// we need to pass a type constructor for ParsersState to various places, so that we can give it
+// the right lifetime; this is a bit convoluted, but works.
+
+pub struct ParsersStateCtr;
+impl StateHolderCtr for ParsersStateCtr {
+    type StateCtr<'a> = ParsersState<'a>;
 }
+

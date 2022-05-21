@@ -1,71 +1,42 @@
-use rust_app::crypto_helpers::*;
+use core::pin::Pin;
 use rust_app::implementation::*;
-use rust_app::interface::*;
-mod utils;
 
-use core::str::from_utf8;
-use nanos_sdk::buttons::ButtonEvent;
+use nanos_sdk::buttons::{ButtonEvent};
 use nanos_sdk::io;
 use nanos_ui::ui;
+use core::cell::RefCell;
+use ledger_async_block::*;
 
 nanos_sdk::set_panic!(nanos_sdk::exiting_panic);
 
-/// Display public key in two separate
-/// message scrollers
-fn show_pubkey() {
-    let pubkey = get_pubkey(&BIP32_PATH);
-    match pubkey {
-        Ok(pk) => {
-            {
-                let hex0 = utils::to_hex(&pk.W[1..33]).unwrap();
-                let m = from_utf8(&hex0).unwrap();
-                ui::MessageScroller::new(m).event_loop();
-            }
-            {
-                let hex1 = utils::to_hex(&pk.W[33..65]).unwrap();
-                let m = from_utf8(&hex1).unwrap();
-                ui::MessageScroller::new(m).event_loop();
-            }
-        }
-        Err(_) => ui::popup("Error"),
-    }
-}
-
-/// Basic nested menu. Will be subject
-/// to simplifications in the future.
-#[allow(clippy::needless_borrow)]
-fn menu_example() {
-    loop {
-        match ui::Menu::new(&[&"PubKey", &"Infos", &"Back", &"Exit App"]).show() {
-            0 => show_pubkey(),
-            1 => loop {
-                match ui::Menu::new(&[&"Copyright", &"Authors", &"Back"]).show() {
-                    0 => ui::popup("2020 Ledger"),
-                    1 => ui::popup("???"),
-                    _ => break,
-                }
-            },
-            2 => return,
-            3 => nanos_sdk::exit_app(2),
-            _ => (),
-        }
-    }
-}
-
-use ledger_parser_combinators::interp_parser::OOB;
 use rust_app::*;
+
+static mut COMM_CELL : Option<RefCell<io::Comm>> = None;
+
+static mut HOST_IO_STATE : Option<RefCell<HostIOState>> = None;
+
+static mut STATES_BACKING : ParsersState<'static> = ParsersState::NoState;
+
+#[inline(never)]
+unsafe fn initialize() {
+    COMM_CELL=Some(RefCell::new(io::Comm::new()));
+    let comm = COMM_CELL.as_ref().unwrap();
+    HOST_IO_STATE=Some(RefCell::new(HostIOState {
+        comm: comm,
+        requested_block: None,
+        sent_command: None,
+    }));
+}
 
 #[cfg(not(test))]
 #[no_mangle]
 extern "C" fn sample_main() {
-    let mut comm = io::Comm::new();
-    // let mut states = parser_states!();
-    // let mut parsers = mk_parsers();
-    let mut states = ParsersState::NoState;
+    unsafe { initialize(); }
+    let comm = unsafe { COMM_CELL.as_ref().unwrap() }; // io::Comm::new();
+    let host_io = HostIO(unsafe { HOST_IO_STATE.as_ref().unwrap() });
+    let mut states = unsafe { Pin::new_unchecked( &mut STATES_BACKING ) };
 
-    use core::mem::size_of_val;
-    info!("State struct uses {} bytes\n", size_of_val(&states));
-    // with_parser_state!(parsers);
+    info!("State struct uses {} bytes\n", core::mem::size_of::<ParsersState<'static>>()); // size_of_val(unsafe { states.into_inner_unchecked() }));
 
     loop {
         // Draw some 'welcome' screen
@@ -73,12 +44,15 @@ extern "C" fn sample_main() {
 
         // Wait for either a specific button push to exit the app
         // or an APDU command
-        match comm.next_event() {
+        let evt = comm.borrow_mut().next_event(); // Need to do this outside of the match so we don't hold on to the reference during the body.
+        match evt {
             io::Event::Button(ButtonEvent::RightButtonRelease) => nanos_sdk::exit_app(0),
-            io::Event::Command(ins) => match handle_apdu(&mut comm, ins, &mut states) {
-                Ok(()) => comm.reply_ok(),
-                Err(sw) => comm.reply(sw),
-            },
+            io::Event::Command(ins) => {
+                trace!("Comm: {:?}", comm);
+                match handle_apdu(host_io, ins, &mut states) {
+                    Ok(()) => { comm.borrow_mut().reply_ok() },
+                    Err(sw) => { trace!("Sending error {:?}", comm); comm.borrow_mut().reply(sw) },
+                } }
             _ => (),
         }
     }
@@ -89,8 +63,6 @@ extern "C" fn sample_main() {
 enum Ins {
     GetPubkey,
     Sign,
-    Menu,
-    ShowPrivateKey,
     Exit,
 }
 
@@ -99,87 +71,31 @@ impl From<u8> for Ins {
         match ins {
             2 => Ins::GetPubkey,
             3 => Ins::Sign,
-            4 => Ins::Menu,
-            0xfe => Ins::ShowPrivateKey,
             0xff => Ins::Exit,
             _ => panic!(),
         }
     }
 }
 
-use arrayvec::ArrayVec;
+// use arrayvec::ArrayVec;
 use nanos_sdk::io::Reply;
 
-use ledger_parser_combinators::interp_parser::InterpParser;
-fn run_parser_apdu<P: InterpParser<A, Returning = ArrayVec<u8, 260>>, A>(
-    states: &mut ParsersState,
-    get_state: fn(&mut ParsersState) -> &mut <P as InterpParser<A>>::State,
-    parser: &P,
-    comm: &mut io::Comm,
-) -> Result<(), Reply> {
-    let cursor = comm.get_data()?;
-
-    loop {
-        trace!("Parsing APDU input: {:?}\n", cursor);
-        let mut parse_destination = None;
-        let parse_rv = <P as InterpParser<A>>::parse(parser, get_state(states), cursor, &mut parse_destination);
-        trace!("Parser result: {:?}\n", parse_rv);
-        match parse_rv {
-            // Explicit rejection; reset the parser. Possibly send error message to host?
-            Err((Some(OOB::Reject), _)) => {
-                *states = ParsersState::NoState;
-                break Err(io::StatusWords::Unknown.into());
-            }
-            // Deliberately no catch-all on the Err((Some case; we'll get error messages if we
-            // add to OOB's out-of-band actions and forget to implement them.
-            //
-            // Finished the chunk with no further actions pending, but not done.
-            Err((None, [])) => break Ok(()),
-            // Didn't consume the whole chunk; reset and error message.
-            Err((None, _)) => {
-                *states = ParsersState::NoState;
-                break Err(io::StatusWords::Unknown.into());
-            }
-            // Consumed the whole chunk and parser finished; send response.
-            Ok([]) => {
-                trace!("Parser finished, resetting state\n");
-                match parse_destination.as_ref() {
-                    Some(rv) => comm.append(&rv[..]),
-                    None => break Err(io::StatusWords::Unknown.into()),
-                }
-                // Parse finished; reset.
-                *states = ParsersState::NoState;
-                break Ok(());
-            }
-            // Parse ended before the chunk did; reset.
-            Ok(_) => {
-                *states = ParsersState::NoState;
-                break Err(io::StatusWords::Unknown.into());
-            }
-        }
-    }
-}
-
-// fn handle_apdu<P: for<'a> FnMut(ParserTag, &'a [u8]) -> RX<'a, ArrayVec<u8, 260> > >(comm: &mut io::Comm, ins: Ins, parser: &mut P) -> Result<(), Reply> {
 #[inline(never)]
-fn handle_apdu(comm: &mut io::Comm, ins: Ins, parser: &mut ParsersState) -> Result<(), Reply> {
-    info!("entering handle_apdu with command {:?}", ins);
-    if comm.rx == 0 {
+fn handle_apdu<'a: 'b, 'b>(io: HostIO, ins: Ins, state: &'b mut Pin<&'a mut ParsersState<'a>>) -> Result<(), Reply> {
+
+    let comm = io.get_comm();
+    if comm?.rx == 0 {
         return Err(io::StatusWords::NothingReceived.into());
     }
 
     match ins {
         Ins::GetPubkey => {
-            run_parser_apdu::<_, Bip32Key>(parser, get_get_address_state, &GET_ADDRESS_IMPL, comm)?
+            poll_apdu_handler(state, io, GetAddress)?
         }
         Ins::Sign => {
-            run_parser_apdu::<_, SignParameters>(parser, get_sign_state, &SIGN_IMPL, comm)?
+            poll_apdu_handler(state, io, Sign)?
         }
-
-        Ins::Menu => menu_example(),
-        Ins::ShowPrivateKey => comm.append(&bip32_derive_secp256k1(&BIP32_PATH)?),
         Ins::Exit => nanos_sdk::exit_app(0),
-        // _ => nanos_sdk::exit_app(0)
     }
     Ok(())
 }
