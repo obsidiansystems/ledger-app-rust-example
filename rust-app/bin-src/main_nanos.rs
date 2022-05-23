@@ -3,10 +3,13 @@ use rust_app::implementation::*;
 use rust_app::interface::*;
 mod utils;
 
+use ledger_parser_combinators::interp_parser::set_from_thunk;
+
 use core::str::from_utf8;
-use nanos_sdk::buttons::ButtonEvent;
 use nanos_sdk::io;
 use nanos_ui::ui;
+
+use prompts_ui::RootMenu;
 
 nanos_sdk::set_panic!(nanos_sdk::exiting_panic);
 
@@ -55,6 +58,8 @@ fn menu_example() {
 use ledger_parser_combinators::interp_parser::OOB;
 use rust_app::*;
 
+const WELCOME_TEXT: &str = "W e l c o m e";
+
 #[cfg(not(test))]
 #[no_mangle]
 extern "C" fn sample_main() {
@@ -63,23 +68,47 @@ extern "C" fn sample_main() {
     // let mut parsers = mk_parsers();
     let mut states = ParsersState::NoState;
 
+    let mut idle_menu = RootMenu::new([ WELCOME_TEXT, "Exit"]);
+    let mut busy_menu = RootMenu::new(["Working...", "Cancel"]);
+
+    let menu = |states: &ParsersState, idle: &mut RootMenu<2>, busy: &mut RootMenu<2>| match states {
+        ParsersState::NoState => idle.show(),
+        _ => busy.show(),
+    };
+
+    menu(&states, &mut idle_menu, &mut busy_menu);
+
     use core::mem::size_of_val;
     info!("State struct uses {} bytes\n", size_of_val(&states));
     // with_parser_state!(parsers);
 
     loop {
-        // Draw some 'welcome' screen
-        ui::SingleMessage::new("W e l c o m e").show();
-
         // Wait for either a specific button push to exit the app
         // or an APDU command
         match comm.next_event() {
-            io::Event::Button(ButtonEvent::RightButtonRelease) => nanos_sdk::exit_app(0),
-            io::Event::Command(ins) => match handle_apdu(&mut comm, ins, &mut states) {
-                Ok(()) => comm.reply_ok(),
-                Err(sw) => comm.reply(sw),
+            io::Event::Command(ins) => {
+                trace!("Command recived");
+                match handle_apdu(&mut comm, ins, &mut states) {
+                    Ok(()) => comm.reply_ok(),
+                    Err(sw) => comm.reply(sw),
+                };
+                menu(&states, & mut idle_menu, & mut busy_menu);
+                trace!("Command done");
             },
-            _ => (),
+            io::Event::Button(btn) => {
+                trace!("Button recived");
+                if let ParsersState::NoState = states {
+                    if let Some(1) = idle_menu.update(btn) {
+                        info!("Exiting app at user direction via root menu");
+                        nanos_sdk::exit_app(0)
+                    }
+                } else if let Some(1) = busy_menu.update(btn) {
+                    info!("Resetting at user direction via busy menu");
+                    set_from_thunk(&mut states, || ParsersState::NoState);
+                };
+                menu(&states, & mut idle_menu, & mut busy_menu);
+                trace!("Button done");
+            },
         }
     }
 }
